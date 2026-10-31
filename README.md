@@ -48,6 +48,12 @@ In modern telecom networks, NOC engineers face a constant deluge of metric fluct
 
 ---
 
+## Preview
+
+![Application Screenshot](preview.png)
+
+
+
 ## 🌟 Key Features
 
 ### 1. Real-Time NOC Dashboard & Tower Health
