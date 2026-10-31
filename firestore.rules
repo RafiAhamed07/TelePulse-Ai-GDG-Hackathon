@@ -1,0 +1,394 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures for TelePulse AI:
+//
+// 1. Organization Document: /orgs/ORG-001
+//    - Fixed demo organization root (SR-2). Read-only metadata, no client writes.
+//
+// 2. Collection: /orgs/ORG-001/incidents/{incidentId}
+//    Document ID: deterministic {sessionId}_{towerId}_{windowStartEpoch}
+//    Fields:
+//      - id: string (optional in payload; if present, must match incidentId, max 128 chars, immutable)
+//      - displayId: string (required, 1..64 chars, immutable) - e.g. INC-DHK104-001
+//      - orgId: string (required, must equal 'ORG-001', immutable)
+//      - sessionId: string (required, 1..64 chars, immutable)
+//      - towerId: string (required, ^[A-Za-z0-9_-]{1,32}$, immutable)
+//      - networkType: string enum (required, '4G' | '5G', immutable)
+//      - severity: string enum (required, 'critical' | 'warning', immutable)
+//      - status: string enum (required, 'Open' on create; forward-only transitions 'Open' -> 'Investigating' | 'Resolved', 'Investigating' -> 'Resolved')
+//      - detectedAt: string ISO-8601 or timestamp (required, immutable)
+//      - detectionRule: string (required, 1..64 chars, immutable)
+//      - triggeringMetrics: list (required, 1..10 items, immutable)
+//      - baseline: map (required, allowed metric keys only, immutable)
+//      - evidenceSamples: list (required, 1..12 items, immutable)
+//      - dataOrigin: string enum (required, 'simulated' | 'uploaded' | 'sample', immutable)
+//      - aiAnalysis: map or null (required, validated schema and bounds when non-null, mutable)
+//      - statusHistory: list (required, 1..20 items, mutable on status transition)
+//      - createdAt: string ISO-8601 or timestamp (required, immutable)
+//      - updatedAt: string ISO-8601 or timestamp (required, mutable)
+//
+// 3. Collection: /orgs/ORG-001/reports/{reportId}
+//    Document ID: reportId
+//    Fields:
+//      - id: string (optional in payload; if present, must match reportId, max 128 chars, immutable)
+//      - orgId: string (optional in payload; if present, must equal 'ORG-001', immutable)
+//      - sessionId: string (required, 1..64 chars, immutable)
+//      - period: map { from, to, label? } (required, immutable)
+//      - generatedAt: string ISO-8601 or timestamp (required, immutable)
+//      - stats: map { incidentCount, bySeverity, byStatus, towersAffected, meanTimeToResolveMinutes } (required, immutable)
+//      - narrative: map { executiveSummary, keyIncidents, recommendationsForReview, caveats } or null (required, immutable)
+//      - model: string (required, 1..100 chars, immutable)
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == resource.data.uid;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    function isValidDateString(dateStr) {
+      return dateStr is string &&
+        dateStr.size() >= 10 &&
+        dateStr.size() <= 64 &&
+        dateStr.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?$");
+    }
+
+    function isValidDateOrTimestamp(val) {
+      return val is timestamp || isValidDateString(val);
+    }
+
+    function isValidList(listVal, maxSize) {
+      return listVal is list && listVal.size() <= maxSize;
+    }
+
+    function isValidMap(mapData, allowedKeys) {
+      return mapData is map && mapData.keys().hasOnly(allowedKeys);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidBaseline(baseline) {
+      let requiredKeys = [
+        'latency_ms',
+        'packet_loss_percent',
+        'jitter_ms',
+        'connected_users',
+        'traffic_mbps',
+        'availability_percent'
+      ];
+      let allowedKeys = [
+        'latency_ms',
+        'packet_loss_percent',
+        'jitter_ms',
+        'signal_strength_dbm',
+        'connected_users',
+        'traffic_mbps',
+        'availability_percent',
+        'sampleCount'
+      ];
+      return baseline is map &&
+        baseline.keys().hasAll(requiredKeys) &&
+        baseline.keys().hasOnly(allowedKeys) &&
+        baseline.latency_ms is number && baseline.latency_ms >= 0 && baseline.latency_ms <= 10000 &&
+        baseline.packet_loss_percent is number && baseline.packet_loss_percent >= 0 && baseline.packet_loss_percent <= 100 &&
+        baseline.jitter_ms is number && baseline.jitter_ms >= 0 && baseline.jitter_ms <= 5000 &&
+        (!('signal_strength_dbm' in baseline) || (baseline.signal_strength_dbm is number && baseline.signal_strength_dbm >= -140 && baseline.signal_strength_dbm <= -30)) &&
+        baseline.connected_users is number && baseline.connected_users >= 0 && baseline.connected_users <= 1000000 &&
+        baseline.traffic_mbps is number && baseline.traffic_mbps >= 0 && baseline.traffic_mbps <= 1000000 &&
+        baseline.availability_percent is number && baseline.availability_percent >= 0 && baseline.availability_percent <= 100 &&
+        (!('sampleCount' in baseline) || (baseline.sampleCount is number && baseline.sampleCount >= 0 && baseline.sampleCount <= 100));
+    }
+
+    function isValidAiAnalysis(analysis) {
+      let requiredKeys = [
+        'generatedAt',
+        'model',
+        'summary',
+        'observedFacts',
+        'possibleCauses',
+        'customerImpact',
+        'recommendedChecks',
+        'uncertainties',
+        'dataGaps',
+        'unverifiedNumberFlags'
+      ];
+      let allowedKeys = [
+        'generatedAt',
+        'model',
+        'summary',
+        'observedFacts',
+        'possibleCauses',
+        'customerImpact',
+        'recommendedChecks',
+        'uncertainties',
+        'dataGaps',
+        'unverifiedNumberFlags',
+        'unsafeCommandFlags',
+        'isRuleBasedFallback'
+      ];
+      return analysis == null || (
+        analysis is map &&
+        analysis.keys().hasAll(requiredKeys) &&
+        analysis.keys().hasOnly(allowedKeys) &&
+        isValidDateOrTimestamp(analysis.generatedAt) &&
+        analysis.model is string && analysis.model.size() >= 1 && analysis.model.size() <= 100 &&
+        analysis.summary is string && analysis.summary.size() >= 1 && analysis.summary.size() <= 1000 &&
+        isValidList(analysis.observedFacts, 20) &&
+        isValidList(analysis.possibleCauses, 10) &&
+        analysis.customerImpact is map &&
+        analysis.customerImpact.keys().hasAll(['description', 'basis']) &&
+        analysis.customerImpact.keys().hasOnly(['description', 'basis']) &&
+        analysis.customerImpact.description is string && analysis.customerImpact.description.size() >= 1 && analysis.customerImpact.description.size() <= 500 &&
+        analysis.customerImpact.basis is string && analysis.customerImpact.basis.size() >= 1 && analysis.customerImpact.basis.size() <= 500 &&
+        isValidList(analysis.recommendedChecks, 10) &&
+        isValidList(analysis.uncertainties, 20) &&
+        isValidList(analysis.dataGaps, 20) &&
+        isValidList(analysis.unverifiedNumberFlags, 20) &&
+        (!('unsafeCommandFlags' in analysis) || isValidList(analysis.unsafeCommandFlags, 20)) &&
+        (!('isRuleBasedFallback' in analysis) || analysis.isRuleBasedFallback is bool)
+      );
+    }
+
+    function isValidIncident(data) {
+      let requiredFields = [
+        'displayId',
+        'orgId',
+        'sessionId',
+        'towerId',
+        'networkType',
+        'severity',
+        'status',
+        'detectedAt',
+        'detectionRule',
+        'triggeringMetrics',
+        'baseline',
+        'evidenceSamples',
+        'dataOrigin',
+        'aiAnalysis',
+        'statusHistory',
+        'createdAt',
+        'updatedAt'
+      ];
+      let allowedFields = [
+        'id',
+        'displayId',
+        'orgId',
+        'sessionId',
+        'towerId',
+        'networkType',
+        'severity',
+        'status',
+        'detectedAt',
+        'detectionRule',
+        'triggeringMetrics',
+        'baseline',
+        'evidenceSamples',
+        'dataOrigin',
+        'aiAnalysis',
+        'statusHistory',
+        'createdAt',
+        'updatedAt'
+      ];
+      return hasRequiredFields(requiredFields) &&
+        hasOnlyAllowedFields(allowedFields) &&
+        (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128)) &&
+        data.displayId is string && data.displayId.size() >= 1 && data.displayId.size() <= 64 &&
+        data.orgId == 'ORG-001' &&
+        data.sessionId is string && data.sessionId.size() >= 1 && data.sessionId.size() <= 64 &&
+        data.towerId is string && data.towerId.size() >= 1 && data.towerId.size() <= 32 &&
+        data.towerId.matches("^[A-Za-z0-9_-]{1,32}$") &&
+        data.networkType in ['4G', '5G'] &&
+        data.severity in ['critical', 'warning'] &&
+        data.status in ['Open', 'Investigating', 'Resolved'] &&
+        isValidDateOrTimestamp(data.detectedAt) &&
+        data.detectionRule is string && data.detectionRule.size() >= 1 && data.detectionRule.size() <= 64 &&
+        isValidList(data.triggeringMetrics, 10) && data.triggeringMetrics.size() >= 1 &&
+        isValidBaseline(data.baseline) &&
+        isValidList(data.evidenceSamples, 12) && data.evidenceSamples.size() >= 1 &&
+        data.dataOrigin in ['simulated', 'uploaded', 'sample'] &&
+        isValidAiAnalysis(data.aiAnalysis) &&
+        isValidList(data.statusHistory, 20) && data.statusHistory.size() >= 1 &&
+        isValidDateOrTimestamp(data.createdAt) &&
+        isValidDateOrTimestamp(data.updatedAt);
+    }
+
+    function isValidForwardStatusTransition(oldStatus, newStatus) {
+      return (oldStatus == 'Open' && (newStatus == 'Investigating' || newStatus == 'Resolved')) ||
+        (oldStatus == 'Investigating' && newStatus == 'Resolved');
+    }
+
+    function isValidIncidentUpdate() {
+      let mutableFields = ['status', 'statusHistory', 'aiAnalysis', 'updatedAt'];
+      let immutableFields = [
+        'id',
+        'displayId',
+        'orgId',
+        'sessionId',
+        'towerId',
+        'networkType',
+        'severity',
+        'detectedAt',
+        'detectionRule',
+        'triggeringMetrics',
+        'baseline',
+        'evidenceSamples',
+        'dataOrigin',
+        'createdAt'
+      ];
+      let affected = request.resource.data.diff(resource.data).affectedKeys();
+      return isValidIncident(request.resource.data) &&
+        affected.hasOnly(mutableFields) &&
+        areImmutableFieldsUnchanged(immutableFields) &&
+        (
+          // Case 1: AI analysis update without changing status or statusHistory
+          (
+            !affected.hasAny(['status', 'statusHistory']) &&
+            request.resource.data.status == resource.data.status &&
+            request.resource.data.statusHistory == resource.data.statusHistory
+          ) ||
+          // Case 2: Forward-only status transition with appended statusHistory entry
+          (
+            isValidForwardStatusTransition(resource.data.status, request.resource.data.status) &&
+            request.resource.data.statusHistory.size() == resource.data.statusHistory.size() + 1
+          )
+        );
+    }
+
+    function isValidReport(data) {
+      let requiredFields = [
+        'sessionId',
+        'period',
+        'generatedAt',
+        'stats',
+        'narrative',
+        'model'
+      ];
+      let allowedFields = [
+        'id',
+        'orgId',
+        'sessionId',
+        'period',
+        'generatedAt',
+        'stats',
+        'narrative',
+        'model'
+      ];
+      return hasRequiredFields(requiredFields) &&
+        hasOnlyAllowedFields(allowedFields) &&
+        (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128)) &&
+        (!('orgId' in data) || data.orgId == 'ORG-001') &&
+        data.sessionId is string && data.sessionId.size() >= 1 && data.sessionId.size() <= 64 &&
+        data.period is map &&
+        data.period.keys().hasAll(['from', 'to']) &&
+        data.period.keys().hasOnly(['from', 'to', 'label']) &&
+        isValidDateOrTimestamp(data.period.from) &&
+        isValidDateOrTimestamp(data.period.to) &&
+        (!('label' in data.period) || (data.period.label is string && data.period.label.size() <= 128)) &&
+        isValidDateOrTimestamp(data.generatedAt) &&
+        data.stats is map &&
+        data.stats.keys().hasAll(['incidentCount', 'bySeverity', 'byStatus', 'towersAffected', 'meanTimeToResolveMinutes']) &&
+        data.stats.keys().hasOnly(['incidentCount', 'bySeverity', 'byStatus', 'towersAffected', 'meanTimeToResolveMinutes']) &&
+        data.stats.incidentCount is number && data.stats.incidentCount >= 0 && data.stats.incidentCount <= 10000 &&
+        data.stats.bySeverity is map && data.stats.bySeverity.keys().hasOnly(['critical', 'warning']) &&
+        data.stats.byStatus is map && data.stats.byStatus.keys().hasOnly(['Open', 'Investigating', 'Resolved']) &&
+        isValidList(data.stats.towersAffected, 50) &&
+        (data.stats.meanTimeToResolveMinutes == null || (data.stats.meanTimeToResolveMinutes is number && data.stats.meanTimeToResolveMinutes >= 0)) &&
+        (
+          data.narrative == null || (
+            data.narrative is map &&
+            data.narrative.keys().hasAll(['executiveSummary', 'keyIncidents', 'recommendationsForReview', 'caveats']) &&
+            data.narrative.keys().hasOnly(['executiveSummary', 'keyIncidents', 'recommendationsForReview', 'caveats']) &&
+            data.narrative.executiveSummary is string && data.narrative.executiveSummary.size() >= 1 && data.narrative.executiveSummary.size() <= 2000 &&
+            isValidList(data.narrative.keyIncidents, 20) &&
+            isValidList(data.narrative.recommendationsForReview, 20) &&
+            isValidList(data.narrative.caveats, 20)
+          )
+        ) &&
+        data.model is string && data.model.size() >= 1 && data.model.size() <= 100;
+    }
+
+    // ===============================================================
+    // Scoped Rules: /orgs/ORG-001 ONLY (SR-2)
+    // ===============================================================
+
+    match /orgs/ORG-001 {
+      allow get: if true;
+      allow list, create, update, delete: if false;
+
+      // SR-3, SR-4, SR-5: Incidents collection
+      match /incidents/{incidentId} {
+        allow read: if true;
+        allow create: if isValidIncident(request.resource.data) &&
+          request.resource.data.status == 'Open' &&
+          (!('id' in request.resource.data) || request.resource.data.id == incidentId);
+        allow update: if isValidIncidentUpdate();
+        allow delete: if false;
+      }
+
+      // SR-5, SR-6: Reports collection (create-only, no update or delete)
+      match /reports/{reportId} {
+        allow read: if true;
+        allow create: if isValidReport(request.resource.data) &&
+          (!('id' in request.resource.data) || request.resource.data.id == reportId);
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+
+    // ===============================================================
+    // Default Deny All Other Paths (SR-1, SR-2, SR-5)
+    // ===============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+

@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+dist-ssr/
+build/
+*.tsbuildinfo
+
+# Environment variables & secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+
+# Credentials, service accounts, keys, certificates
+*service-account*.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Firebase cache & logs
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# Logs & OS/Editor files
+logs
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
