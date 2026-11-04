@@ -199,7 +199,7 @@ In modern telecom networks, NOC engineers face a constant deluge of metric fluct
 
 ## 🎯 Golden Path Demo Walkthrough
 
-Judges and evaluators can verify the end-to-end functionality in **under 2 minutes**:
+Judges and evaluators can easily verify the end-to-end functionality in **under 2 minutes**:
 
 1. **Access the NOC Portal:**
    - Launch `http://localhost:5173` and click **"1-Click Fast-Track Demo Access"**.
